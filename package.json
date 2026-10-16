@@ -1,0 +1,75 @@
+{
+  "name": "sql-erd-visualizer",
+  "publisher": "Danni96",
+  "displayName": "SQL ERD Visual Editor (Postgres, MySQL, SQLite)",
+  "description": "Visualiza, edita tablas, columnas y conecta relaciones (Foreign Keys) en archivos .sql con sincronización bidireccional en vivo.",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Danni96/sql-preview.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:sqlErd.diagramEditor",
+    "onCommand:sqlErd.openDiagramSideBySide"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "sqlErd.diagramEditor",
+        "displayName": "SQL ERD Visual Diagram",
+        "selector": [
+          {
+            "filenamePattern": "*.sql"
+          },
+          {
+            "filenamePattern": "*.ddl"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "sqlErd.openDiagramSideBySide",
+        "title": "SQL ERD: Abrir Diagrama Visual al Lado",
+        "icon": "$(type-hierarchy-sub)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "sqlErd.openDiagramSideBySide",
+          "when": "resourceExtname == .sql || resourceExtname == .ddl",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "sqlErd.openDiagramSideBySide",
+          "when": "resourceExtname == .sql || resourceExtname == .ddl",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
