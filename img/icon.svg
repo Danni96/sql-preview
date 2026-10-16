@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="50%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#090d16"/>
+    </linearGradient>
+    <linearGradient id="blueHeader" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="amberHeader" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="indigoHeader" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4f46e5"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded Background -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bgGrad)" stroke="#38bdf8" stroke-width="5"/>
+
+  <!-- Subtle Grid Lines -->
+  <g stroke="#1e293b" stroke-width="2" opacity="0.6">
+    <line x1="128" y1="32" x2="128" y2="480"/>
+    <line x1="256" y1="32" x2="256" y2="480"/>
+    <line x1="384" y1="32" x2="384" y2="480"/>
+    <line x1="32" y1="128" x2="480" y2="128"/>
+    <line x1="32" y1="256" x2="480" y2="256"/>
+    <line x1="32" y1="384" x2="480" y2="384"/>
+  </g>
+
+  <!-- Bezier Relationship Curves -->
+  <path d="M 224 148 C 280 148, 250 245, 304 245" fill="none" stroke="#38bdf8" stroke-width="7" filter="url(#glow)"/>
+  <path d="M 224 372 C 280 372, 250 285, 304 285" fill="none" stroke="#f59e0b" stroke-width="7" filter="url(#glow)"/>
+
+  <!-- Table 1 (Top Left - Users) -->
+  <g transform="translate(56, 68)">
+    <rect x="0" y="0" width="168" height="136" rx="16" fill="#0f172a" stroke="#475569" stroke-width="4"/>
+    <path d="M 0 16 Q 0 0 16 0 L 152 0 Q 168 0 168 16 L 168 38 L 0 38 Z" fill="url(#blueHeader)"/>
+    <circle cx="24" cy="62" r="7" fill="#f59e0b"/>
+    <rect x="42" y="56" width="84" height="12" rx="6" fill="#e2e8f0"/>
+    <circle cx="24" cy="92" r="6" fill="#64748b"/>
+    <rect x="42" y="86" width="102" height="12" rx="6" fill="#94a3b8"/>
+    <circle cx="24" cy="118" r="6" fill="#64748b"/>
+    <rect x="42" y="112" width="68" height="12" rx="6" fill="#94a3b8"/>
+    <!-- Right Port -->
+    <circle cx="168" cy="80" r="10" fill="#0f172a" stroke="#38bdf8" stroke-width="5"/>
+  </g>
+
+  <!-- Table 2 (Bottom Left - Products) -->
+  <g transform="translate(56, 296)">
+    <rect x="0" y="0" width="168" height="136" rx="16" fill="#0f172a" stroke="#475569" stroke-width="4"/>
+    <path d="M 0 16 Q 0 0 16 0 L 152 0 Q 168 0 168 16 L 168 38 L 0 38 Z" fill="url(#amberHeader)"/>
+    <circle cx="24" cy="62" r="7" fill="#f59e0b"/>
+    <rect x="42" y="56" width="90" height="12" rx="6" fill="#e2e8f0"/>
+    <circle cx="24" cy="92" r="6" fill="#64748b"/>
+    <rect x="42" y="86" width="76" height="12" rx="6" fill="#94a3b8"/>
+    <circle cx="24" cy="118" r="6" fill="#64748b"/>
+    <rect x="42" y="112" width="96" height="12" rx="6" fill="#94a3b8"/>
+    <!-- Right Port -->
+    <circle cx="168" cy="76" r="10" fill="#0f172a" stroke="#f59e0b" stroke-width="5"/>
+  </g>
+
+  <!-- Table 3 (Right - Orders / Relations) -->
+  <g transform="translate(304, 176)">
+    <rect x="0" y="0" width="160" height="160" rx="16" fill="#0f172a" stroke="#38bdf8" stroke-width="4"/>
+    <path d="M 0 16 Q 0 0 16 0 L 144 0 Q 160 0 160 16 L 160 40 L 0 40 Z" fill="url(#indigoHeader)"/>
+    <circle cx="24" cy="68" r="7" fill="#f59e0b"/>
+    <rect x="42" y="62" width="78" height="12" rx="6" fill="#e2e8f0"/>
+    <circle cx="24" cy="100" r="7" fill="#38bdf8"/>
+    <rect x="42" y="94" width="96" height="12" rx="6" fill="#cbd5e1"/>
+    <circle cx="24" cy="132" r="7" fill="#38bdf8"/>
+    <rect x="42" y="126" width="84" height="12" rx="6" fill="#cbd5e1"/>
+    <!-- Left Target Ports -->
+    <circle cx="0" cy="69" r="10" fill="#0f172a" stroke="#38bdf8" stroke-width="5"/>
+    <circle cx="0" cy="109" r="10" fill="#0f172a" stroke="#f59e0b" stroke-width="5"/>
+  </g>
+</svg>

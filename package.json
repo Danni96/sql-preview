@@ -1,0 +1,107 @@
+{
+  "name": "sql-erd-visualizer",
+  "publisher": "Danni96",
+  "displayName": "SQL ERD Visual Editor",
+  "description": "Visualiza, diseña y edita diagramas Entidad-Relación (ERD) en tiempo real desde archivos .sql y .dbml con sincronización bidireccional y colaboración en equipo.",
+  "version": "0.2.5",
+  "icon": "img/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Danni96/sql-preview.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:sqlErd.sidebarView",
+    "onCustomEditor:sqlErd.diagramEditor",
+    "onCommand:sqlErd.openDiagramSideBySide",
+    "onCommand:sqlErd.joinCollabRoom"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sql-erd-sidebar",
+          "title": "SQL ERD Visual Editor",
+          "icon": "img/activitybar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "sql-erd-sidebar": [
+        {
+          "type": "webview",
+          "id": "sqlErd.sidebarView",
+          "name": "Sala Colaborativa & Archivos SQL"
+        }
+      ]
+    },
+    "customEditors": [
+      {
+        "viewType": "sqlErd.diagramEditor",
+        "displayName": "SQL ERD Visual Diagram",
+        "selector": [
+          {
+            "filenamePattern": "*.sql"
+          },
+          {
+            "filenamePattern": "*.ddl"
+          },
+          {
+            "filenamePattern": "*.dbml"
+          },
+          {
+            "filenamePattern": "*.erd"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "sqlErd.openDiagramSideBySide",
+        "title": "SQL ERD: Abrir Diagrama Visual al Lado",
+        "icon": "$(type-hierarchy-sub)"
+      },
+      {
+        "command": "sqlErd.joinCollabRoom",
+        "title": "SQL ERD: Unirse a Sala Colaborativa (Abrir archivo y diagrama compartido)",
+        "icon": "$(broadcast)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "sqlErd.openDiagramSideBySide",
+          "when": "resourceExtname == .sql || resourceExtname == .ddl || resourceExtname == .dbml || resourceExtname == .erd",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "sqlErd.openDiagramSideBySide",
+          "when": "resourceExtname == .sql || resourceExtname == .ddl || resourceExtname == .dbml || resourceExtname == .erd",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
