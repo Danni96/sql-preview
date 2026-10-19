@@ -177,7 +177,8 @@ export class SqlCollabRoomServer {
     private getFileName: () => string,
     private getSchema: () => SqlSchema,
     private onRemoteDelta: (delta: CollabDelta, senderPeerId: string) => void,
-    private getWebClientHtml: () => string
+    private getWebClientHtml: () => string,
+    private onPeersChanged?: (peers: CollabPeer[]) => void
   ) {
     // Registrar al propio Host como participante activo en la sala
     this.peers.set('host', {
@@ -225,6 +226,7 @@ export class SqlCollabRoomServer {
           const color = url.searchParams.get('color') || '#38bdf8';
 
           if (peerId && name) {
+            const isNew = !this.peers.has(peerId);
             const existing = this.peers.get(peerId);
             this.peers.set(peerId, {
               peerId,
@@ -235,14 +237,22 @@ export class SqlCollabRoomServer {
               activeTable: existing?.activeTable,
               lastSeen: Date.now()
             });
+            if (isNew) {
+              this.onPeersChanged?.(Array.from(this.peers.values()));
+            }
           }
 
           // Prune inactive peers (>15s without heartbeat)
           const now = Date.now();
+          let pruned = false;
           for (const [pid, p] of this.peers.entries()) {
             if (pid !== 'host' && now - p.lastSeen > 15000) {
               this.peers.delete(pid);
+              pruned = true;
             }
+          }
+          if (pruned) {
+            this.onPeersChanged?.(Array.from(this.peers.values()));
           }
 
           const schema = this.getSchema();
@@ -415,9 +425,11 @@ export class SqlCollabRoomServer {
   }
 
   public broadcastPeers(): void {
+    const list = Array.from(this.peers.values());
+    this.onPeersChanged?.(list);
     this.broadcast({
       type: 'peers',
-      peers: Array.from(this.peers.values())
+      peers: list
     });
   }
 

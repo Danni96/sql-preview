@@ -3,7 +3,7 @@
   "publisher": "Danni96",
   "displayName": "SQL ERD Visual Editor",
   "description": "Visualiza, diseña y edita diagramas Entidad-Relación (ERD) en tiempo real desde archivos .sql y .dbml con sincronización bidireccional y colaboración en equipo.",
-  "version": "0.2.5",
+  "version": "0.5.4",
   "icon": "img/icon.png",
   "repository": {
     "type": "git",

@@ -15,10 +15,15 @@ import {
   applyDeltaToSchema,
   CollabDelta
 } from './collabServer';
+import {
+  fetchRemoteDatabaseSchema,
+  RemoteDbConfig
+} from './remoteDbConnector';
 
 // Mapa de archivos locales que se abrieron al unirse a una sala remota: normalizedPath -> roomInfo
 const pendingJoinedRooms = new Map<string, { roomUrl: string; userName: string }>();
 const activeEditorConnectors = new Map<string, (roomUrl: string, userName: string) => void>();
+const activeRoomStoppers = new Set<() => void>();
 let activeSidebarProvider: SqlErdSidebarProvider | null = null;
 
 function normPathKey(fsPath: string): string {
@@ -58,16 +63,15 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Comando para que cualquier compañero se una a una sala sin tener el archivo aún:
-  // descarga el .sql/.dbml compartido, lo abre a la izquierda y abre el diagrama en vivo a la derecha.
+  // Comando para que cualquier compañero se una a una sala (en modo Puente Ligero sin archivo local, o sincronizando archivo)
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'sqlErd.joinCollabRoom',
-      async (prefilledUrl?: string) => {
+      async (prefilledUrl?: string, bridgeOnlyMode = false) => {
         const roomUrl =
           prefilledUrl ||
           (await vscode.window.showInputBox({
-            prompt: 'Ingresa la URL de la Sala Colaborativa (ej. http://192.168.1.50:4580)',
+            prompt: 'Ingresa la URL de la Sala / Puente Remoto (ej. http://192.168.1.50:4580)',
             placeHolder: 'http://localhost:4580'
           }));
         if (!roomUrl) {
@@ -77,11 +81,24 @@ export function activate(context: vscode.ExtensionContext) {
         const userName =
           (await vscode.window.showInputBox({
             prompt: 'Tu nombre para mostrar tu cursor en el diagrama',
-            value: os.userInfo().username || ' Compañero'
+            value: os.userInfo().username || 'Compañero'
           })) || 'Compañero';
 
         try {
-          const state = await fetchRoomInitialState(roomUrl);
+          const cleanRoomUrl = roomUrl.trim().replace(/\/+$/, '');
+          const state = await fetchRoomInitialState(cleanRoomUrl);
+
+          // Si activó Modo Puente Ligero, abrir visor directo sin crear ni parsear archivo pesado en la PC
+          if (bridgeOnlyMode) {
+            SqlErdEditorProvider.openLightweightBridgePanel(
+              cleanRoomUrl,
+              userName,
+              state.fileName || 'Puente Remoto',
+              state.schema
+            );
+            return;
+          }
+
           const workspaceDir =
             vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.tmpdir();
           const safeName = path.basename(state.fileName || 'shared_schema.sql');
@@ -89,7 +106,6 @@ export function activate(context: vscode.ExtensionContext) {
 
           fs.writeFileSync(localFilePath, state.sqlText, 'utf8');
           const fileUri = vscode.Uri.file(localFilePath);
-          const cleanRoomUrl = roomUrl.trim().replace(/\/+$/, '');
           const key = normPathKey(localFilePath);
 
           pendingJoinedRooms.set(key, {
@@ -141,6 +157,77 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
     );
   }
 
+  /**
+   * Abre un visor en Modo Puente Ligero (0 archivos pesados locales en la PC).
+   * Toda la lógica y persistencia ocurre en el servidor remoto / anfitrión.
+   */
+  public static openLightweightBridgePanel(
+    roomUrl: string,
+    userName: string,
+    title: string,
+    initialSchema: SqlSchema
+  ): void {
+    const panel = vscode.window.createWebviewPanel(
+      'sqlErd.bridgeViewer',
+      `⚡ Puente Remoto: ${title}`,
+      vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+    const dummyProvider = new SqlErdEditorProvider({} as any);
+    panel.webview.html = dummyProvider.getHtmlForWebview(panel.webview, false);
+
+    let currentSchema = initialSchema;
+    const client = new SqlCollabNodeClient(roomUrl, userName, msg => {
+      if (msg.type === 'init' && msg.schema) {
+        currentSchema = msg.schema;
+        panel.webview.postMessage({ type: 'schemaUpdated', schema: currentSchema });
+        if (Array.isArray(msg.peers)) {
+          panel.webview.postMessage({ type: 'peersUpdated', peers: msg.peers });
+          activeSidebarProvider?.notifyPeersUpdated(msg.peers);
+        }
+      } else if (msg.type === 'peers' && Array.isArray(msg.peers)) {
+        panel.webview.postMessage({ type: 'peersUpdated', peers: msg.peers });
+        activeSidebarProvider?.notifyPeersUpdated(msg.peers);
+      } else if (msg.type === 'delta' && msg.peerId !== client.peerId) {
+        const d: CollabDelta = msg.delta;
+        if (d.kind === 'cursor') {
+          panel.webview.postMessage({ type: 'remoteCursor', peer: d.peer });
+        } else if (applyDeltaToSchema(currentSchema, d)) {
+          panel.webview.postMessage({ type: 'schemaUpdated', schema: currentSchema });
+        }
+      }
+    });
+
+    const stopFn = () => {
+      client.disconnect();
+      panel.webview.postMessage({ type: 'roomStopped' });
+      activeSidebarProvider?.notifyRoomStopped();
+    };
+    activeRoomStoppers.add(stopFn);
+
+    panel.webview.onDidReceiveMessage(message => {
+      if (message.type === 'ready') {
+        panel.webview.postMessage({ type: 'schemaUpdated', schema: currentSchema });
+        client.connect();
+        panel.webview.postMessage({ type: 'joinedRoomSuccess', roomUrl });
+      } else if (message.type === 'collabDelta' && message.delta) {
+        client.sendDelta(message.delta);
+      } else if (message.type === 'updateSchema' && message.schema) {
+        currentSchema = message.schema;
+        client.sendDelta({ kind: 'fullSchema', schema: currentSchema });
+      } else if (message.type === 'updateLayoutOnly' && message.schema) {
+        currentSchema = message.schema;
+      } else if (message.type === 'stopHostRoom') {
+        stopFn();
+      }
+    });
+
+    panel.onDidDispose(() => {
+      activeRoomStoppers.delete(stopFn);
+      client.disconnect();
+    });
+  }
+
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   public async resolveCustomTextEditor(
@@ -173,9 +260,11 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
           });
           if (Array.isArray(msg.peers)) {
             webviewPanel.webview.postMessage({ type: 'peersUpdated', peers: msg.peers });
+            activeSidebarProvider?.notifyPeersUpdated(msg.peers);
           }
         } else if (msg.type === 'peers' && Array.isArray(msg.peers)) {
           webviewPanel.webview.postMessage({ type: 'peersUpdated', peers: msg.peers });
+          activeSidebarProvider?.notifyPeersUpdated(msg.peers);
         } else if (msg.type === 'delta' && msg.peerId !== collabNodeClient?.peerId) {
           const d: CollabDelta = msg.delta;
           if (d.kind === 'cursor') {
@@ -198,6 +287,49 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
 
     const docKey = normPathKey(document.uri.fsPath);
     activeEditorConnectors.set(docKey, connectGuestNodeClient);
+    const stopCurrentCollabSession = () => {
+      if (collabServer) {
+        collabServer.stop();
+        collabServer = null;
+      }
+      if (collabNodeClient) {
+        collabNodeClient.disconnect();
+        collabNodeClient = null;
+      }
+      webviewPanel.webview.postMessage({ type: 'roomStopped' });
+      activeSidebarProvider?.notifyRoomStopped();
+    };
+    activeRoomStoppers.add(stopCurrentCollabSession);
+
+    // Actualización quirúrgica de solo la línea @sql-erd-layout al mover tablas (evita reescribir miles de líneas en VS Code)
+    const applyLayoutOnlyToDocument = async (updatedSchema: SqlSchema) => {
+      currentSchemaCache = updatedSchema;
+      const layoutObj: Record<string, { x: number; y: number }> = {};
+      for (const t of updatedSchema.tables) {
+        layoutObj[t.name] = { x: Math.round(t.x), y: Math.round(t.y) };
+      }
+      const prefix = updatedSchema.dialect === 'dbml' ? '// @sql-erd-layout:' : '-- @sql-erd-layout:';
+      const newLayoutLine = `${prefix} ${JSON.stringify(layoutObj)}`;
+      const text = document.getText();
+      const layoutRegex = /^(\s*(?:--|\/\/)\s*@sql-erd-layout:\s*\{.*\})\s*$/m;
+      const match = layoutRegex.exec(text);
+
+      isApplyingFromWebview = true;
+      try {
+        const edit = new vscode.WorkspaceEdit();
+        if (match && match.index !== undefined) {
+          const startPos = document.positionAt(match.index);
+          const endPos = document.positionAt(match.index + match[0].length);
+          edit.replace(document.uri, new vscode.Range(startPos, endPos), newLayoutLine);
+        } else {
+          const endPos = document.positionAt(text.length);
+          edit.insert(document.uri, endPos, `\n${newLayoutLine}\n`);
+        }
+        await vscode.workspace.applyEdit(edit);
+      } finally {
+        isApplyingFromWebview = false;
+      }
+    };
 
     const applySchemaToDocument = async (updatedSchema: SqlSchema) => {
       currentSchemaCache = updatedSchema;
@@ -297,10 +429,12 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
                     peer: delta.peer
                   });
                   if (collabServer) {
+                    const peers = collabServer.getPeers();
                     webviewPanel.webview.postMessage({
                       type: 'peersUpdated',
-                      peers: collabServer.getPeers()
+                      peers
                     });
+                    activeSidebarProvider?.notifyPeersUpdated(peers);
                   }
                 } else if (applyDeltaToSchema(currentSchemaCache, delta)) {
                   await applySchemaToDocument(currentSchemaCache);
@@ -310,11 +444,17 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
                   });
                 }
               },
-              () => this.getHtmlForWebview(webviewPanel.webview, true)
+              () => this.getHtmlForWebview(webviewPanel.webview, true),
+              peers => {
+                webviewPanel.webview.postMessage({
+                  type: 'peersUpdated',
+                  peers
+                });
+                activeSidebarProvider?.notifyPeersUpdated(peers);
+              }
             );
           }
           const port = await collabServer.start(4580);
-          // Activar puente de puerto automático de VS Code (útil si corre en WSL2 / Remote)
           try {
             await vscode.env.asExternalUri(
               vscode.Uri.parse(`http://localhost:${port}`)
@@ -329,18 +469,20 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
             label: `${i.name}${i.isVirtual ? ' (Virtual/WSL)' : ' (LAN Wi-Fi/Red)'}`,
             url: `http://${i.address}:${port}`
           }));
+          const initialPeers = collabServer.getPeers();
           webviewPanel.webview.postMessage({
             type: 'hostRoomStarted',
             roomUrl,
             port,
-            allUrls
+            allUrls,
+            peers: initialPeers
           });
           if (activeSidebarProvider) {
-            activeSidebarProvider.notifyHostStarted(roomUrl, port, allUrls);
+            activeSidebarProvider.notifyHostStarted(roomUrl, port, allUrls, initialPeers);
           }
           vscode.env.clipboard.writeText(roomUrl);
           vscode.window.showInformationMessage(
-            `Sala colaborativa activa en ${roomUrl} (copiada al portapapeles). Revisa el icono SQL ERD en la barra lateral izquierda para ver todas tus IPs o crear un túnel.`
+            `Sala colaborativa activa en ${roomUrl} (copiada al portapapeles).`
           );
         } catch (err) {
           vscode.window.showErrorMessage(`Error al iniciar sala: ${String(err)}`);
@@ -348,12 +490,21 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
         return;
       }
 
+      if (message.type === 'switchToScriptOnly') {
+        await vscode.window.showTextDocument(document, vscode.ViewColumn.One);
+        webviewPanel.dispose();
+        return;
+      }
+
       if (message.type === 'stopHostRoom') {
-        if (collabServer) {
-          collabServer.stop();
-          collabServer = null;
-        }
-        vscode.window.showInformationMessage('Sala colaborativa cerrada.');
+        stopCurrentCollabSession();
+        vscode.window.showInformationMessage('Sala colaborativa detenida.');
+        return;
+      }
+
+      if (message.type === 'updateLayoutOnly') {
+        const updatedSchema: SqlSchema = message.schema;
+        await applyLayoutOnlyToDocument(updatedSchema);
         return;
       }
 
@@ -371,6 +522,7 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
 
     webviewPanel.onDidDispose(() => {
       activeEditorConnectors.delete(docKey);
+      activeRoomStoppers.delete(stopCurrentCollabSession);
       if (debounceTimer) {
         clearTimeout(debounceTimer);
       }
@@ -420,24 +572,22 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       color: var(--fg);
       font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);
       font-size: 12px;
+      display: flex;
+      flex-direction: column;
     }
 
     .toolbar {
-      position: fixed;
-      top: 10px;
-      left: 10px;
-      right: 10px;
-      min-height: 44px;
+      flex-shrink: 0;
+      width: 100%;
       background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      border-bottom: 1px solid var(--border);
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       padding: 6px 12px;
       gap: 8px;
       z-index: 100;
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
     }
 
     .toolbar-title {
@@ -491,69 +641,123 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       margin-left: auto;
     }
 
-    #viewport {
-      width: 100vw;
-      height: 100vh;
+    #main-workspace {
+      flex: 1;
+      display: flex;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
       position: relative;
-      overflow: auto;
-      background-image: radial-gradient(var(--border) 1px, transparent 1px);
-      background-size: 24px 24px;
+    }
+
+    #viewport {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      position: relative;
+      overflow: hidden;
+      background-color: var(--bg);
+      cursor: grab;
+    }
+
+    #viewport.panning {
+      cursor: grabbing;
+    }
+
+    body.is-interacting .table-node {
+      box-shadow: none !important;
     }
 
     #canvas-scaler {
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 2;
       transform-origin: 0 0;
-      will-change: transform;
     }
 
     #canvas {
       position: relative;
-      width: 3200px;
-      height: 2400px;
+      width: 8000px;
+      height: 6000px;
     }
 
-    svg#edges-layer {
+    canvas#edges-canvas {
       position: absolute;
       top: 0;
       left: 0;
       width: 100%;
       height: 100%;
       pointer-events: none;
-      z-index: 1;
+      z-index: 0;
     }
 
-    svg#edges-layer path.edge-path {
-      fill: none;
-      stroke: var(--fk);
-      stroke-width: 2px;
-      opacity: 0.65;
-      pointer-events: stroke;
+    /* Panel Explorador Progresivo acoplado a la izquierda sin tapar el lienzo */
+    #explorer-drawer {
+      flex-shrink: 0;
+      width: 245px;
+      height: 100%;
+      background: var(--card);
+      border-right: 1px solid var(--border);
+      z-index: 95;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #explorer-drawer.open {
+      display: flex;
+    }
+
+    .explorer-header {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .explorer-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px;
+    }
+
+    .explorer-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 6px;
+      border-radius: 4px;
       cursor: pointer;
+      font-size: 11px;
     }
 
-    svg#edges-layer path.edge-path.highlighted {
-      stroke: var(--pk);
-      stroke-width: 3.2px;
-      opacity: 1;
+    .explorer-item:hover {
+      background: rgba(255,255,255,0.06);
     }
 
-    svg#edges-layer path.edge-path.dimmed {
-      opacity: 0.12;
+    .ref-chip {
+      font-size: 9.5px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(56, 189, 248, 0.14);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      color: var(--fk);
+      cursor: pointer;
+      white-space: nowrap;
+      max-width: 110px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
-    svg#edges-layer path.edge-path:hover {
-      stroke: var(--danger);
-      stroke-width: 3.5px;
-      opacity: 1;
+    .ref-chip:hover {
+      background: var(--fk);
+      color: #0f172a;
+      font-weight: 700;
     }
 
-    svg#edges-layer path.temp-edge {
-      fill: none;
-      stroke: var(--pk);
-      stroke-width: 2.2px;
-      stroke-dasharray: 5, 5;
-    }
-
-    /* Tarjeta de Tabla optimizada con GPU transform */
+    /* Tarjeta de Tabla ligera (sin will-change permanente para no saturar VRAM de la GPU) */
     .table-node {
       position: absolute;
       top: 0;
@@ -562,10 +766,8 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
       z-index: 2;
-      will-change: transform;
-      contain: layout style;
+      contain: layout style paint;
     }
 
     .table-node.selected-table {
@@ -598,7 +800,7 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       text-overflow: ellipsis;
       white-space: nowrap;
       max-width: 175px;
-      cursor: text;
+      cursor: grab;
       padding: 2px 4px;
       border-radius: 4px;
     }
@@ -805,16 +1007,25 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       <option value="mysql">MySQL / MariaDB</option>
       <option value="sqlite">SQLite</option>
     </select>
-    <input id="search-input" type="text" placeholder="🔍 Filtrar tabla..." style="width:130px;" />
+    <input id="search-input" type="text" placeholder="🔍 Filtrar tabla..." style="width:120px;" />
+    <button id="explorer-btn" title="Opción 5: Explorador Progresivo (elegir qué tablas mostrar en el lienzo)">🗺️ Explorador</button>
+    <select id="edge-mode-select" title="Opción 3: Preferencia de visualización de líneas y chips de relación">
+      <option value="smart">🔗 Líneas: Cortas + Chips</option>
+      <option value="selected">🔗 Líneas: Solo Seleccionada</option>
+      <option value="chips">🔗 Líneas: Solo Chips (0 líneas)</option>
+      <option value="all">🔗 Líneas: Todas</option>
+    </select>
     <button id="compact-mode-btn" title="Muestra solo llaves PK/FK para acelerar esquemas grandes">⚡ Compacta</button>
     <button id="neighbors-btn" title="Al seleccionar una tabla, mostrar solo ella y sus tablas conectadas">🎯 Conectadas</button>
     <button class="primary" id="add-table-btn">+ Tabla</button>
     <button id="auto-layout-btn" title="Agrupar y ordenar tablas automáticamente">Auto-Ordenar</button>
+    <button id="script-only-btn" title="Ocultar el diagrama visual y mostrar únicamente el código del script">📄 Solo Script</button>
     <div class="collab-bar">
       <button id="host-room-btn" title="Iniciar sala colaborativa en tiempo real para tu equipo (+10 usuarios)">🟢 Compartir Sala</button>
+      <button id="stop-room-btn" style="display:none;background:rgba(239,68,68,0.2);border-color:#ef4444;color:#fca5a5;font-weight:600;" title="Detener o salir de la sala colaborativa">🔴 Detener Sala</button>
       <input id="join-url-input" type="text" placeholder="http://ip:4580" style="width:115px;" title="URL de la sala colaborativa" />
       <button id="join-room-btn" title="Conectar a la sala de un compañero">🔗 Unirse</button>
-      <span id="peers-badge" class="peers-pill" style="display:none;">1 en sala</span>
+      <span id="peers-badge" class="peers-pill" style="display:none;"></span>
     </div>
     <span id="stats-badge" style="font-size:11px;opacity:0.85;"></span>
     <div class="zoom-controls">
@@ -825,12 +1036,33 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
     </div>
   </div>
 
-  <div id="viewport">
-    <div id="canvas-scaler">
-      <div id="canvas">
-        <svg id="edges-layer"></svg>
-        <div id="nodes-layer"></div>
-        <div id="cursors-layer"></div>
+  <div id="main-workspace">
+    <div id="explorer-drawer">
+      <div class="explorer-header">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <b style="font-size:12px;">🗺️ Explorador Progresivo</b>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span id="explorer-count" style="font-size:10.5px;opacity:0.8;"></span>
+            <button id="explorer-close-btn" class="icon-btn danger" title="Cerrar panel explorador">✕</button>
+          </div>
+        </div>
+        <input id="explorer-search" type="text" placeholder="Buscar en todas las tablas..." style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:4px 7px;border-radius:4px;font-size:11px;" />
+        <div style="display:flex;gap:4px;">
+          <button id="exp-all-btn" style="flex:1;padding:3px;font-size:10.5px;cursor:pointer;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;">Ver Todas</button>
+          <button id="exp-top25-btn" style="flex:1;padding:3px;font-size:10.5px;cursor:pointer;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;">Top 25</button>
+          <button id="exp-clear-btn" style="flex:1;padding:3px;font-size:10.5px;cursor:pointer;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;">Limpiar</button>
+        </div>
+      </div>
+      <div id="explorer-list" class="explorer-list"></div>
+    </div>
+
+    <div id="viewport">
+      <canvas id="edges-canvas"></canvas>
+      <div id="canvas-scaler">
+        <div id="canvas">
+          <div id="nodes-layer"></div>
+          <div id="cursors-layer"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -851,28 +1083,45 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       relations: []
     };
 
-    // Opciones de rendimiento y visualización
-    let compactMode = false; // Si hay >30 tablas se activa automáticamente al cargar
+    // Opciones de rendimiento y visualización (Opciones 3, 4 y 5)
+    let compactMode = false;
     let autoCompactApplied = false;
     let isolateNeighbors = false;
+    let edgeDisplayMode = 'smart'; // 'smart' | 'selected' | 'chips' | 'all'
+    let progressiveSet = new Set(); // Tablas activas en el Explorador Progresivo
+    let progressiveInitialized = false;
+    let explorerFilter = '';
     let selectedTableName = null;
-    let expandedTables = new Set(); // Tablas expandidas manualmente en modo compacto
+    let expandedTables = new Set();
     let zoomLevel = 1;
+    let panX = 20;
+    let panY = 20;
     let searchTerm = '';
 
     // Mapa matemático O(1) de coordenadas de puertos: key = "tableName.colName" -> { sourceX, sourceY, targetX, targetY }
     let portCoordsMap = new Map();
     let visibleTableNames = new Set();
+    let tableNodeMap = new Map(); // tableName -> HTMLElement
 
     let draggingTable = null;
     let dragStartMouse = { x: 0, y: 0 };
     let dragStartTable = { x: 0, y: 0 };
+    let isPanningCanvas = false;
+    let panStartMouse = { x: 0, y: 0 };
+    let panStartScroll = { left: 0, top: 0 };
     let connectingFrom = null;
     let rafPending = false;
-
+    const viewportEl = document.getElementById('viewport');
     const nodesLayer = document.getElementById('nodes-layer');
-    const edgesLayer = document.getElementById('edges-layer');
+    const edgesCanvas = document.getElementById('edges-canvas');
+    const edgesCtx = edgesCanvas.getContext('2d');
     const dialectSelect = document.getElementById('dialect-select');
+    const edgeModeSelect = document.getElementById('edge-mode-select');
+    const explorerBtn = document.getElementById('explorer-btn');
+    const explorerDrawer = document.getElementById('explorer-drawer');
+    const explorerList = document.getElementById('explorer-list');
+    const explorerSearch = document.getElementById('explorer-search');
+    const explorerCount = document.getElementById('explorer-count');
     const searchInput = document.getElementById('search-input');
     const statsBadge = document.getElementById('stats-badge');
     const canvasEl = document.getElementById('canvas');
@@ -881,21 +1130,145 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
     const neighborsBtn = document.getElementById('neighbors-btn');
     const zoomLabel = document.getElementById('zoom-label');
 
+    function applyCameraTransform() {
+      canvasScaler.style.transform = \`translate3d(\${Math.round(panX)}px, \${Math.round(panY)}px, 0) scale(\${zoomLevel})\`;
+    }
+
+    function resizeEdgesCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = viewportEl.getBoundingClientRect();
+      edgesCanvas.width = Math.max(1, rect.width) * dpr;
+      edgesCanvas.height = Math.max(1, rect.height) * dpr;
+      edgesCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      applyCameraTransform();
+      renderEdges();
+    }
+    window.addEventListener('resize', resizeEdgesCanvas);
+
+    edgeModeSelect.addEventListener('change', () => {
+      edgeDisplayMode = edgeModeSelect.value;
+      renderSchema();
+    });
+
+    explorerBtn.addEventListener('click', () => {
+      explorerDrawer.classList.toggle('open');
+      explorerBtn.classList.toggle('active-toggle', explorerDrawer.classList.contains('open'));
+      renderExplorerList();
+      requestAnimationFrame(resizeEdgesCanvas);
+    });
+
+    document.getElementById('explorer-close-btn').addEventListener('click', () => {
+      explorerDrawer.classList.remove('open');
+      explorerBtn.classList.remove('active-toggle');
+      requestAnimationFrame(resizeEdgesCanvas);
+    });
+
+    explorerSearch.addEventListener('input', () => {
+      explorerFilter = explorerSearch.value.trim().toLowerCase();
+      renderExplorerList();
+    });
+
+    document.getElementById('exp-all-btn').addEventListener('click', () => {
+      schema.tables.forEach(t => progressiveSet.add(t.name));
+      renderExplorerList();
+      renderSchema();
+    });
+
+    document.getElementById('exp-top25-btn').addEventListener('click', () => {
+      progressiveSet.clear();
+      schema.tables.slice(0, 25).forEach(t => progressiveSet.add(t.name));
+      renderExplorerList();
+      renderSchema();
+    });
+
+    document.getElementById('exp-clear-btn').addEventListener('click', () => {
+      progressiveSet.clear();
+      renderExplorerList();
+      renderSchema();
+    });
+
+    function renderExplorerList() {
+      if (!explorerDrawer.classList.contains('open')) return;
+      explorerCount.textContent = \`\${progressiveSet.size}/\${schema.tables.length} activas\`;
+      const frag = document.createDocumentFragment();
+      for (const t of schema.tables) {
+        if (explorerFilter && !t.name.toLowerCase().includes(explorerFilter)) continue;
+        const item = document.createElement('label');
+        item.className = 'explorer-item';
+        const left = document.createElement('span');
+        left.style.display = 'flex';
+        left.style.alignItems = 'center';
+        left.style.gap = '6px';
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = progressiveSet.has(t.name);
+        chk.addEventListener('change', () => {
+          if (chk.checked) progressiveSet.add(t.name);
+          else progressiveSet.delete(t.name);
+          explorerCount.textContent = \`\${progressiveSet.size}/\${schema.tables.length} activas\`;
+          renderSchema();
+        });
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = t.name;
+        left.appendChild(chk);
+        left.appendChild(nameSpan);
+
+        const focusBtn = document.createElement('button');
+        focusBtn.className = 'icon-btn';
+        focusBtn.textContent = '🎯';
+        focusBtn.title = 'Ir a esta tabla + traer sus conectadas';
+        focusBtn.addEventListener('click', e => {
+          e.preventDefault();
+          e.stopPropagation();
+          progressiveSet.add(t.name);
+          for (const r of schema.relations) {
+            if (r.fromTable === t.name) progressiveSet.add(r.toTable);
+            if (r.toTable === t.name) progressiveSet.add(r.fromTable);
+          }
+          selectedTableName = t.name;
+          renderExplorerList();
+          renderSchema();
+          panX = Math.round(viewportEl.clientWidth / 2 - (t.x + 140) * zoomLevel);
+          panY = Math.round(viewportEl.clientHeight / 2 - (t.y + 80) * zoomLevel);
+          applyCameraTransform();
+          renderEdges();
+          updateViewportCulling();
+        });
+
+        item.appendChild(left);
+        item.appendChild(focusBtn);
+        frag.appendChild(item);
+      }
+      explorerList.replaceChildren(frag);
+    }
+
     function setZoom(newZoom) {
-      zoomLevel = Math.max(0.25, Math.min(1.75, Math.round(newZoom * 20) / 20));
-      canvasScaler.style.transform = \`scale(\${zoomLevel})\`;
+      zoomLevel = Math.max(0.2, Math.min(2.0, Math.round(newZoom * 20) / 20));
+      applyCameraTransform();
       zoomLabel.textContent = \`\${Math.round(zoomLevel * 100)}%\`;
+      renderEdges();
+      updateViewportCulling();
     }
 
     document.getElementById('zoom-out-btn').addEventListener('click', () => setZoom(zoomLevel - 0.15));
     document.getElementById('zoom-in-btn').addEventListener('click', () => setZoom(zoomLevel + 0.15));
-    document.getElementById('zoom-reset-btn').addEventListener('click', () => setZoom(1));
+    document.getElementById('zoom-reset-btn').addEventListener('click', () => {
+      panX = 20;
+      panY = 20;
+      setZoom(1);
+    });
 
-    // Soporte de Ctrl + Rueda del ratón para hacer zoom suave
-    document.getElementById('viewport').addEventListener('wheel', e => {
+    // Rueda del ratón: con Ctrl/Cmd hace Zoom; sin Ctrl desplaza el lienzo libremente
+    viewportEl.addEventListener('wheel', e => {
+      e.preventDefault();
       if (e.ctrlKey || e.metaKey) {
-        e.preventDefault();
         setZoom(zoomLevel + (e.deltaY < 0 ? 0.1 : -0.1));
+      } else {
+        panX -= e.deltaX;
+        panY -= e.deltaY;
+        applyCameraTransform();
+        renderEdges();
+        if (schema.tables.length > 30) updateViewportCulling();
       }
     }, { passive: false });
 
@@ -941,9 +1314,24 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
     let remotePeers = new Map();
     const cursorsLayer = document.getElementById('cursors-layer');
     const hostRoomBtn = document.getElementById('host-room-btn');
+    const stopRoomBtn = document.getElementById('stop-room-btn');
     const joinUrlInput = document.getElementById('join-url-input');
     const joinRoomBtn = document.getElementById('join-room-btn');
     const peersBadge = document.getElementById('peers-badge');
+
+    function renderPeersBadge(peers) {
+      if (!Array.isArray(peers) || peers.length === 0) {
+        peersBadge.style.display = 'none';
+        return;
+      }
+      peersBadge.style.display = 'inline-flex';
+      peersBadge.style.alignItems = 'center';
+      peersBadge.style.gap = '6px';
+      const names = peers
+        .map(p => \`<span style="display:inline-flex;align-items:center;gap:3px;"><span style="width:7px;height:7px;border-radius:50%;background:\${p.color || '#38bdf8'};display:inline-block;"></span>\${p.name}</span>\`)
+        .join(' · ');
+      peersBadge.innerHTML = \`👥 \${peers.length}: \${names}\`;
+    }
 
     let isCollabActive = isStandaloneWeb;
     let lastWebRevision = 0;
@@ -1014,7 +1402,14 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
               if (tb) {
                 tb.x = d.x;
                 tb.y = d.y;
-                renderSchema();
+                const nodeEl = tableNodeMap.get(tb.name);
+                if (nodeEl) {
+                  nodeEl.style.transform = \`translate3d(\${tb.x}px, \${tb.y}px, 0)\`;
+                  recomputePortCoordinatesForTable(tb);
+                  updateEdgesForTable(tb.name);
+                } else {
+                  renderSchema();
+                }
               }
             } else if (d.kind === 'fullSchema') {
               schema = d.schema;
@@ -1051,6 +1446,12 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
     } else {
       hostRoomBtn.addEventListener('click', () => {
         vscode.postMessage({ type: 'startHostRoom' });
+      });
+      document.getElementById('script-only-btn').addEventListener('click', () => {
+        vscode.postMessage({ type: 'switchToScriptOnly' });
+      });
+      stopRoomBtn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'stopHostRoom' });
       });
       joinRoomBtn.addEventListener('click', () => {
         const url = joinUrlInput.value.trim();
@@ -1123,51 +1524,98 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       return \`M \${x1} \${y1} C \${x1 + dx} \${y1}, \${x2 - dx} \${y2}, \${x2} \${y2}\`;
     }
 
+    // Opción 4 + Opción 3: Dibujo ultrarrápido en <canvas> 2D fijo del tamaño de la ventana (< 0.4ms)
+    function updateEdgesForTable(_tableName) {
+      renderEdges();
+    }
+
     function renderEdges(tempMousePos = null) {
-      const frag = document.createDocumentFragment();
+      if (!edgesCtx) return;
+      const w = viewportEl.clientWidth || window.innerWidth;
+      const h = viewportEl.clientHeight || window.innerHeight;
+      edgesCtx.clearRect(0, 0, w, h);
+
+      if (edgeDisplayMode === 'chips' && !connectingFrom) {
+        return;
+      }
 
       for (const rel of schema.relations) {
         if (!visibleTableNames.has(rel.fromTable) || !visibleTableNames.has(rel.toTable)) {
           continue;
         }
+
+        const isSelectedRel =
+          selectedTableName &&
+          (rel.fromTable === selectedTableName || rel.toTable === selectedTableName);
+
+        if (edgeDisplayMode === 'selected' && !isSelectedRel) {
+          continue;
+        }
+
         const fromPt = portCoordsMap.get(\`\${rel.fromTable}.\${rel.fromColumn}\`);
         const toPt = portCoordsMap.get(\`\${rel.toTable}.\${rel.toColumn}\`);
         if (!fromPt || !toPt) continue;
 
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        let cls = 'edge-path';
-        if (selectedTableName) {
-          if (rel.fromTable === selectedTableName || rel.toTable === selectedTableName) {
-            cls += ' highlighted';
-          } else {
-            cls += ' dimmed';
-          }
+        const dist = Math.hypot(toPt.targetX - fromPt.sourceX, toPt.targetY - fromPt.sourceY);
+
+        if (edgeDisplayMode === 'smart' && dist > 950 && !isSelectedRel) {
+          continue;
         }
-        path.setAttribute('class', cls);
-        path.setAttribute('d', createBezierPath(fromPt.sourceX, fromPt.sourceY, toPt.targetX, toPt.targetY));
-        path.setAttribute('title', \`FK: \${rel.fromTable}.\${rel.fromColumn} → \${rel.toTable}.\${rel.toColumn} (Click para eliminar)\`);
 
-        path.addEventListener('click', e => {
-          e.stopPropagation();
-          schema.relations = schema.relations.filter(r => r.id !== rel.id);
-          renderEdges();
-          syncToExtension();
-        });
+        // Convertir coordenadas del mundo a coordenadas del viewport usando panX / panY libres
+        const x1 = fromPt.sourceX * zoomLevel + panX;
+        const y1 = fromPt.sourceY * zoomLevel + panY;
+        const x2 = toPt.targetX * zoomLevel + panX;
+        const y2 = toPt.targetY * zoomLevel + panY;
 
-        frag.appendChild(path);
+        if (
+          (x1 < -100 && x2 < -100) ||
+          (x1 > w + 100 && x2 > w + 100) ||
+          (y1 < -100 && y2 < -100) ||
+          (y1 > h + 100 && y2 > h + 100)
+        ) {
+          continue;
+        }
+
+        const dx = Math.max(Math.abs(x2 - x1) * 0.45, 45 * zoomLevel);
+        edgesCtx.beginPath();
+        edgesCtx.moveTo(x1, y1);
+        edgesCtx.bezierCurveTo(x1 + dx, y1, x2 - dx, y2, x2, y2);
+
+        if (isSelectedRel) {
+          edgesCtx.strokeStyle = '#f59e0b';
+          edgesCtx.lineWidth = 2.8;
+          edgesCtx.globalAlpha = 1;
+        } else if (selectedTableName) {
+          edgesCtx.strokeStyle = '#38bdf8';
+          edgesCtx.lineWidth = 1.6;
+          edgesCtx.globalAlpha = 0.16;
+        } else {
+          edgesCtx.strokeStyle = '#38bdf8';
+          edgesCtx.lineWidth = 1.8;
+          edgesCtx.globalAlpha = 0.65;
+        }
+        edgesCtx.stroke();
       }
 
       if (connectingFrom && tempMousePos) {
-        const tempPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        tempPath.setAttribute('class', 'temp-edge');
-        tempPath.setAttribute(
-          'd',
-          createBezierPath(connectingFrom.startX, connectingFrom.startY, tempMousePos.x, tempMousePos.y)
-        );
-        frag.appendChild(tempPath);
-      }
+        const x1 = connectingFrom.startX * zoomLevel + panX;
+        const y1 = connectingFrom.startY * zoomLevel + panY;
+        const x2 = tempMousePos.x * zoomLevel + panX;
+        const y2 = tempMousePos.y * zoomLevel + panY;
+        const dx = Math.max(Math.abs(x2 - x1) * 0.45, 45 * zoomLevel);
 
-      edgesLayer.replaceChildren(frag);
+        edgesCtx.beginPath();
+        edgesCtx.setLineDash([5, 5]);
+        edgesCtx.moveTo(x1, y1);
+        edgesCtx.bezierCurveTo(x1 + dx, y1, x2 - dx, y2, x2, y2);
+        edgesCtx.strokeStyle = '#f59e0b';
+        edgesCtx.lineWidth = 2.2;
+        edgesCtx.globalAlpha = 1;
+        edgesCtx.stroke();
+        edgesCtx.setLineDash([]);
+      }
+      edgesCtx.globalAlpha = 1;
     }
 
     // Edición inline ligera bajo demanda (no crea miles de <input> al inicio)
@@ -1202,15 +1650,28 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
     function renderSchema() {
       dialectSelect.value = schema.dialect || 'postgres';
 
-      // Si el esquema tiene muchas tablas (>25), activar Vista Compacta automáticamente la primera vez
+      // Si el esquema tiene muchas tablas (>25), activar Vista Compacta y Explorador Progresivo inicialmente
       if (!autoCompactApplied && schema.tables.length > 25) {
         compactMode = true;
         autoCompactApplied = true;
         compactBtn.classList.add('active-toggle');
       }
 
+      if (!progressiveInitialized && schema.tables.length > 0) {
+        progressiveInitialized = true;
+        // Cargar todas las tablas sin abrir el recuadro encima; el usuario abre "🗺️ Explorador" solo cuando quiera filtrar
+        schema.tables.forEach(t => progressiveSet.add(t.name));
+      } else if (progressiveInitialized) {
+        if (progressiveSet.size === 0) {
+          schema.tables.forEach(t => progressiveSet.add(t.name));
+        }
+      }
+
+      renderExplorerList();
+
       portCoordsMap.clear();
       visibleTableNames.clear();
+      tableNodeMap.clear();
 
       // Determinar conjunto de tablas conectadas si isolateNeighbors está activo
       let neighborSet = null;
@@ -1227,6 +1688,9 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       const nodesFrag = document.createDocumentFragment();
 
       for (const table of schema.tables) {
+        if (!searchTerm && !progressiveSet.has(table.name)) {
+          continue;
+        }
         if (searchTerm && !table.name.toLowerCase().includes(searchTerm)) {
           continue;
         }
@@ -1248,6 +1712,7 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
         const node = document.createElement('div');
         node.className = 'table-node' + (selectedTableName === table.name ? ' selected-table' : '');
         node.style.transform = \`translate3d(\${table.x}px, \${table.y}px, 0)\`;
+        tableNodeMap.set(table.name, node);
 
         node.addEventListener('mousedown', e => {
           if (selectedTableName !== table.name) {
@@ -1260,6 +1725,23 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
               renderEdges();
             }
           }
+          // Permitir arrastrar la tabla tomándola desde cualquier parte de la tarjeta (excepto puertos, botones o inputs)
+          const tag = e.target.tagName;
+          const cls = e.target.className || '';
+          if (
+            tag === 'INPUT' ||
+            tag === 'BUTTON' ||
+            (typeof cls === 'string' && (cls.includes('port') || cls.includes('pk-badge') || cls.includes('ref-chip')))
+          ) {
+            return;
+          }
+          e.stopPropagation();
+          draggingTable = { table, nodeEl: node };
+          dragStartMouse.x = e.clientX;
+          dragStartMouse.y = e.clientY;
+          dragStartTable.x = table.x;
+          dragStartTable.y = table.y;
+          document.body.classList.add('is-interacting');
         });
 
         // Header
@@ -1285,6 +1767,22 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
         const headerActions = document.createElement('div');
         headerActions.style.display = 'flex';
         headerActions.style.gap = '2px';
+
+        // Botón Opción 5: Traer al lienzo todas las tablas conectadas a esta tabla
+        const bringNeighborsBtn = document.createElement('button');
+        bringNeighborsBtn.className = 'icon-btn';
+        bringNeighborsBtn.textContent = '🔗+';
+        bringNeighborsBtn.title = 'Traer al lienzo todas las tablas conectadas con esta';
+        bringNeighborsBtn.addEventListener('mousedown', e => e.stopPropagation());
+        bringNeighborsBtn.addEventListener('click', () => {
+          for (const r of schema.relations) {
+            if (r.fromTable === table.name) progressiveSet.add(r.toTable);
+            if (r.toTable === table.name) progressiveSet.add(r.fromTable);
+          }
+          selectedTableName = table.name;
+          renderSchema();
+        });
+        headerActions.appendChild(bringNeighborsBtn);
 
         if (compactMode && table.columns.length > visibleCols.length) {
           const expandBtn = document.createElement('button');
@@ -1331,11 +1829,13 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
         // Iniciar arrastre fluido con GPU transform
         header.addEventListener('mousedown', e => {
           if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+          e.stopPropagation();
           draggingTable = { table, nodeEl: node };
           dragStartMouse.x = e.clientX;
           dragStartMouse.y = e.clientY;
           dragStartTable.x = table.x;
           dragStartTable.y = table.y;
+          document.body.classList.add('is-interacting');
         });
 
         node.appendChild(header);
@@ -1444,10 +1944,43 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
           row.appendChild(targetPort);
           row.appendChild(pkBadge);
           if (fkSet.has(col.name) && !col.isPrimaryKey) {
-            const fkBadge = document.createElement('span');
-            fkBadge.className = 'fk-badge';
-            fkBadge.textContent = 'FK';
-            row.appendChild(fkBadge);
+            const outRel = schema.relations.find(
+              r => r.fromTable === table.name && r.fromColumn === col.name
+            );
+            if (outRel) {
+              // Opción 3: Chip de referencia clicable (-> tabla_destino) + clic derecho para eliminar FK
+              const refChip = document.createElement('span');
+              refChip.className = 'ref-chip';
+              refChip.textContent = \`→ \${outRel.toTable}\`;
+              refChip.title = \`FK hacia \${outRel.toTable}.\${outRel.toColumn} (Clic: ir a la tabla | Clic derecho: eliminar FK)\`;
+              refChip.addEventListener('click', e => {
+                e.stopPropagation();
+                progressiveSet.add(outRel.toTable);
+                selectedTableName = outRel.toTable;
+                renderSchema();
+                const targetTbl = schema.tables.find(t => t.name === outRel.toTable);
+                if (targetTbl) {
+                  panX = Math.round(viewportEl.clientWidth / 2 - (targetTbl.x + 140) * zoomLevel);
+                  panY = Math.round(viewportEl.clientHeight / 2 - (targetTbl.y + 80) * zoomLevel);
+                  applyCameraTransform();
+                  renderEdges();
+                  updateViewportCulling();
+                }
+              });
+              refChip.addEventListener('contextmenu', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                schema.relations = schema.relations.filter(r => r.id !== outRel.id);
+                renderSchema();
+                syncToExtension();
+              });
+              row.appendChild(refChip);
+            } else {
+              const fkBadge = document.createElement('span');
+              fkBadge.className = 'fk-badge';
+              fkBadge.textContent = 'FK';
+              row.appendChild(fkBadge);
+            }
           }
           row.appendChild(colNameSpan);
           row.appendChild(colTypeSpan);
@@ -1500,25 +2033,56 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
 
       nodesLayer.replaceChildren(nodesFrag);
       renderEdges();
+      updateViewportCulling();
+    }
+
+    // Virtualización de Pantalla (Viewport Frustum Culling con panX / panY infinito):
+    function updateViewportCulling() {
+      if (schema.tables.length <= 30) return;
+      const margin = 420;
+      const viewLeft = (-panX) / zoomLevel - margin;
+      const viewTop = (-panY) / zoomLevel - margin;
+      const viewRight = (viewportEl.clientWidth - panX) / zoomLevel + margin;
+      const viewBottom = (viewportEl.clientHeight - panY) / zoomLevel + margin;
+
+      for (const table of schema.tables) {
+        const nodeEl = tableNodeMap.get(table.name);
+        if (!nodeEl) continue;
+        const inView =
+          table.x + TABLE_WIDTH >= viewLeft &&
+          table.x <= viewRight &&
+          table.y + 260 >= viewTop &&
+          table.y <= viewBottom;
+        const shouldShow = inView || (draggingTable && draggingTable.table.name === table.name);
+        nodeEl.style.display = shouldShow ? '' : 'none';
+      }
     }
 
     let lastDragSent = 0;
-    // Arrastre acelerado por hardware + requestAnimationFrame (60 FPS garantizados incluso con 100 tablas)
+    // Arrastre libre infinito en las 4 direcciones + movimiento de tablas sin bordes
     window.addEventListener('mousemove', e => {
-      if (!draggingTable && !connectingFrom) return;
+      if (!draggingTable && !connectingFrom && !isPanningCanvas) return;
       if (rafPending) return;
       rafPending = true;
 
       requestAnimationFrame(() => {
         rafPending = false;
+        if (isPanningCanvas) {
+          panX = panStartScroll.left + (e.clientX - panStartMouse.x);
+          panY = panStartScroll.top + (e.clientY - panStartMouse.y);
+          applyCameraTransform();
+          renderEdges();
+          if (schema.tables.length > 30) updateViewportCulling();
+          return;
+        }
         if (draggingTable) {
           const dx = (e.clientX - dragStartMouse.x) / zoomLevel;
           const dy = (e.clientY - dragStartMouse.y) / zoomLevel;
-          draggingTable.table.x = Math.max(10, Math.round(dragStartTable.x + dx));
-          draggingTable.table.y = Math.max(60, Math.round(dragStartTable.y + dy));
+          draggingTable.table.x = Math.round(dragStartTable.x + dx);
+          draggingTable.table.y = Math.round(dragStartTable.y + dy);
           draggingTable.nodeEl.style.transform = \`translate3d(\${draggingTable.table.x}px, \${draggingTable.table.y}px, 0)\`;
           recomputePortCoordinatesForTable(draggingTable.table);
-          renderEdges();
+          updateEdgesForTable(draggingTable.table.name);
           const now = Date.now();
           if (isCollabActive && now - lastDragSent > 50) {
             lastDragSent = now;
@@ -1530,19 +2094,24 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
             });
           }
         } else if (connectingFrom) {
-          const canvasRect = canvasEl.getBoundingClientRect();
+          const vpRect = viewportEl.getBoundingClientRect();
           renderEdges({
-            x: (e.clientX - canvasRect.left) / zoomLevel,
-            y: (e.clientY - canvasRect.top) / zoomLevel
+            x: (e.clientX - vpRect.left - panX) / zoomLevel,
+            y: (e.clientY - vpRect.top - panY) / zoomLevel
           });
         }
       });
     });
 
     window.addEventListener('mouseup', () => {
+      document.body.classList.remove('is-interacting');
+      if (isPanningCanvas) {
+        isPanningCanvas = false;
+        viewportEl.classList.remove('panning');
+      }
       if (draggingTable) {
         draggingTable = null;
-        syncToExtension();
+        vscode.postMessage({ type: 'updateLayoutOnly', schema });
       }
       if (connectingFrom) {
         connectingFrom = null;
@@ -1550,9 +2119,24 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
-    // Clic en el fondo limpia la selección
-    document.getElementById('viewport').addEventListener('mousedown', e => {
-      if (e.target.id === 'viewport' || e.target.id === 'canvas' || e.target.id === 'edges-layer') {
+    // Arrastrar el fondo con el mouse (Panning libre infinito en cualquier dirección)
+    viewportEl.addEventListener('mousedown', e => {
+      const isBg =
+        e.target.id === 'viewport' ||
+        e.target.id === 'canvas-scaler' ||
+        e.target.id === 'canvas' ||
+        e.target.id === 'edges-canvas' ||
+        e.target.id === 'nodes-layer' ||
+        e.button === 1;
+      if (isBg) {
+        isPanningCanvas = true;
+        panStartMouse.x = e.clientX;
+        panStartMouse.y = e.clientY;
+        panStartScroll.left = panX;
+        panStartScroll.top = panY;
+        viewportEl.classList.add('panning');
+        document.body.classList.add('is-interacting');
+
         if (selectedTableName) {
           selectedTableName = null;
           if (isolateNeighbors) {
@@ -1581,8 +2165,10 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
           ? 'INTEGER'
           : 'INT AUTO_INCREMENT';
 
+      const newTableName = \`tabla_\${index}\`;
+      progressiveSet.add(newTableName);
       schema.tables.push({
-        name: \`tabla_\${index}\`,
+        name: newTableName,
         x: 80 + ((index - 1) % 4) * 330,
         y: 80 + Math.floor((index - 1) / 4) * 240,
         columns: [
@@ -1639,17 +2225,36 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
         isCollabActive = true;
         hostRoomBtn.textContent = '🟢 Sala Activa (' + msg.port + ')';
         hostRoomBtn.classList.add('active-toggle');
+        stopRoomBtn.style.display = 'inline-block';
+        stopRoomBtn.textContent = '🔴 Detener Sala';
         joinUrlInput.value = msg.roomUrl;
-        peersBadge.style.display = 'inline-block';
+        if (Array.isArray(msg.peers)) {
+          renderPeersBadge(msg.peers);
+        }
       } else if (msg.type === 'joinedRoomSuccess') {
         isCollabActive = true;
         joinUrlInput.value = msg.roomUrl;
         joinRoomBtn.textContent = '🟢 Conectado';
         joinRoomBtn.classList.add('active-toggle');
-        peersBadge.style.display = 'inline-block';
+        stopRoomBtn.style.display = 'inline-block';
+        stopRoomBtn.textContent = '🔴 Salir';
+      } else if (msg.type === 'roomStopped') {
+        isCollabActive = false;
+        hostRoomBtn.textContent = '🟢 Compartir Sala';
+        hostRoomBtn.classList.remove('active-toggle');
+        joinRoomBtn.textContent = '🔗 Unirse';
+        joinRoomBtn.classList.remove('active-toggle');
+        stopRoomBtn.style.display = 'none';
+        peersBadge.style.display = 'none';
+        remotePeers.clear();
+        renderRemoteCursors();
       } else if (msg.type === 'peersUpdated' && Array.isArray(msg.peers)) {
-        peersBadge.style.display = 'inline-block';
-        peersBadge.textContent = '👥 ' + msg.peers.length + ' en sala';
+        renderPeersBadge(msg.peers);
+        const activeIds = new Set(msg.peers.map(p => p.peerId));
+        for (const k of remotePeers.keys()) {
+          if (!activeIds.has(k)) remotePeers.delete(k);
+        }
+        renderRemoteCursors();
       } else if (msg.type === 'remoteCursor' && msg.peer) {
         remotePeers.set(msg.peer.peerId, msg.peer);
         renderRemoteCursors();
@@ -1658,6 +2263,7 @@ export class SqlErdEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
+    resizeEdgesCanvas();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
@@ -1679,13 +2285,33 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
   public notifyHostStarted(
     roomUrl: string,
     port: number,
-    allUrls: { label: string; url: string }[]
+    allUrls: { label: string; url: string }[],
+    peers: any[] = []
   ) {
     this.lastHostInfo = { roomUrl, port, allUrls };
     if (this._view) {
       this._view.webview.postMessage({
         type: 'hostInfo',
-        ...this.lastHostInfo
+        ...this.lastHostInfo,
+        peers
+      });
+    }
+  }
+
+  public notifyPeersUpdated(peers: any[]) {
+    if (this._view) {
+      this._view.webview.postMessage({
+        type: 'peersList',
+        peers
+      });
+    }
+  }
+
+  public notifyRoomStopped() {
+    this.lastHostInfo = null;
+    if (this._view) {
+      this._view.webview.postMessage({
+        type: 'roomStopped'
       });
     }
   }
@@ -1739,11 +2365,58 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
       } else if (msg.type === 'joinRoom') {
         const url = String(msg.roomUrl || '').trim();
         if (url) {
-          await vscode.commands.executeCommand('sqlErd.joinCollabRoom', url);
+          await vscode.commands.executeCommand(
+            'sqlErd.joinCollabRoom',
+            url,
+            Boolean(msg.bridgeOnly)
+          );
         }
       } else if (msg.type === 'copyUrl') {
         vscode.env.clipboard.writeText(String(msg.url || ''));
         vscode.window.showInformationMessage(`Copiado: ${msg.url}`);
+      } else if (msg.type === 'stopAllRooms') {
+        for (const stopFn of activeRoomStoppers) {
+          stopFn();
+        }
+        vscode.window.showInformationMessage('Sala colaborativa detenida.');
+      } else if (msg.type === 'connectRemoteDb') {
+        const cfg: RemoteDbConfig = msg.config;
+        try {
+          vscode.window.showInformationMessage(
+            `Conectando al servidor remoto (${cfg.host}) y extrayendo metadatos ligeros...`
+          );
+          const remoteSchema = await fetchRemoteDatabaseSchema(cfg);
+          if (remoteSchema.tables.length === 0) {
+            vscode.window.showWarningMessage(
+              'La consulta remota no devolvió tablas (verifica el nombre de base de datos, esquema o filtro).'
+            );
+            return;
+          }
+          const sqlText = generateSqlFromSchema(remoteSchema);
+          const workspaceDir =
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.tmpdir();
+          const safeDbName = (cfg.database || 'remote_db')
+            .replace(/[^a-zA-Z0-9_-]/g, '_');
+          const localFilePath = path.join(workspaceDir, `${safeDbName}_remote.sql`);
+          fs.writeFileSync(localFilePath, sqlText, 'utf8');
+
+          const fileUri = vscode.Uri.file(localFilePath);
+          const doc = await vscode.workspace.openTextDocument(fileUri);
+          await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+          await vscode.commands.executeCommand(
+            'vscode.openWith',
+            fileUri,
+            SqlErdEditorProvider.viewType,
+            vscode.ViewColumn.Beside
+          );
+          vscode.window.showInformationMessage(
+            `¡Esquema remoto cargado con éxito (${remoteSchema.tables.length} tablas, ${remoteSchema.relations.length} relaciones, 0 filas pesadas)!`
+          );
+        } catch (err) {
+          vscode.window.showErrorMessage(
+            `Error al extraer esquema remoto: ${String(err)}`
+          );
+        }
       } else if (msg.type === 'openPortsView') {
         await vscode.commands.executeCommand('~ports.focus');
       }
@@ -1776,7 +2449,7 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
       align-items: center;
       gap: 6px;
     }
-    input[type="text"] {
+    input[type="text"], input[type="password"], input[type="number"], select {
       width: 100%;
       box-sizing: border-box;
       padding: 6px 8px;
@@ -1849,22 +2522,61 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div class="card">
-    <h3>🔗 Unirse a Sala Colaborativa</h3>
+    <h3>🔗 Unirse a Sala / Puente Remoto</h3>
     <input id="room-url" type="text" placeholder="Ej: http://192.168.1.50:4580" />
-    <button id="join-btn">Entrar y Abrir Archivo + Diagrama</button>
+    <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:11px;cursor:pointer;">
+      <input id="bridge-only-chk" type="checkbox" checked />
+      <span>⚡ <b>Modo Puente Ligero</b> (0 carga en tu PC: no crea ni procesa archivo local)</span>
+    </label>
+    <button id="join-btn">Conectar al Puente / Sala</button>
     <div class="hint">
-      Descarga automáticamente el archivo <b>.sql / .dbml</b> del anfitrión y abre el diagrama sincronizado en vivo.
+      En <b>Modo Puente Ligero</b>, el servidor remoto o anfitrión lleva toda la carga del archivo y tu VS Code funciona solo como visor/editor ultraligero.
     </div>
   </div>
 
   <div class="card">
-    <h3>🟢 Estado de tu Sala (Anfitrión)</h3>
+    <h3>🟢 Estado de tu Sala y Conectados</h3>
     <div id="host-status" class="hint">
       Abre un diagrama y pulsa <b>"🟢 Compartir Sala"</b> en la barra superior para generar tus enlaces de red.
     </div>
+    <button id="stop-room-sidebar-btn" style="display:none;background:#dc2626;color:#fff;margin-top:6px;">🔴 Detener / Salir de Sala Colaborativa</button>
+    <div id="peers-container" style="margin-top:8px;"></div>
     <div id="ips-list"></div>
     <div class="hint" style="margin-top:8px;">
       💡 <b>¿No les carga tu IP local?</b> Si usas <b>WSL2</b> o el <b>Firewall de Windows</b> bloquea el puerto <code>4580</code>, ve a la pestaña <b>Puertos (Ports)</b> de VS Code abajo, agrega el puerto <b>4580</b>, cámbialo a <b>Public</b> y pásales esa URL <code>https://...devtunnels.ms</code>.
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>☁️ Conexión a BD Remota (Ligera)</h3>
+    <select id="db-engine">
+      <option value="postgres">PostgreSQL Remoto (Metadatos)</option>
+      <option value="url">URL Remota (.sql / .dbml)</option>
+    </select>
+    <div id="pg-fields">
+      <div style="display:flex;gap:6px;">
+        <input id="db-host" type="text" placeholder="Host / IP (ej. 10.0.0.15)" style="flex:2;" />
+        <input id="db-port" type="number" placeholder="5432" value="5432" style="flex:1;" />
+      </div>
+      <div style="display:flex;gap:6px;">
+        <input id="db-user" type="text" placeholder="Usuario (postgres)" style="flex:1;" />
+        <input id="db-pass" type="password" placeholder="Contraseña" style="flex:1;" />
+      </div>
+      <div style="display:flex;gap:6px;">
+        <input id="db-name" type="text" placeholder="Base de Datos" style="flex:1;" />
+        <input id="db-schema" type="text" placeholder="Esquema (public)" value="public" style="flex:1;" />
+      </div>
+      <input id="db-filter" type="text" placeholder="Filtro opcional de tablas (ej: mnt_%)" />
+      <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:11px;cursor:pointer;">
+        <input id="db-ssl" type="checkbox" /> Usar conexión segura SSL / TLS
+      </label>
+    </div>
+    <div id="url-fields" style="display:none;">
+      <input id="db-remote-url" type="text" placeholder="https://servidor.com/esquema.sql" />
+    </div>
+    <button id="connect-db-btn">⚡ Extraer Esquema sin Sobrecargar PC</button>
+    <div class="hint">
+      Consulta únicamente <code>information_schema</code> en el servidor remoto (0 filas de datos) y puedes filtrar por módulo (<code>mnt_%</code>) para no consumir memoria en tu PC.
     </div>
   </div>
 
@@ -1879,8 +2591,9 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
 
     document.getElementById('join-btn').addEventListener('click', () => {
       const roomUrl = document.getElementById('room-url').value.trim();
+      const bridgeOnly = document.getElementById('bridge-only-chk').checked;
       if (roomUrl) {
-        vscode.postMessage({ type: 'joinRoom', roomUrl });
+        vscode.postMessage({ type: 'joinRoom', roomUrl, bridgeOnly });
       }
     });
 
@@ -1888,11 +2601,101 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'openDiagram' });
     });
 
+    const dbEngineSelect = document.getElementById('db-engine');
+    const pgFields = document.getElementById('pg-fields');
+    const urlFields = document.getElementById('url-fields');
+
+    dbEngineSelect.addEventListener('change', () => {
+      if (dbEngineSelect.value === 'url') {
+        pgFields.style.display = 'none';
+        urlFields.style.display = 'block';
+      } else {
+        pgFields.style.display = 'block';
+        urlFields.style.display = 'none';
+      }
+    });
+
+    document.getElementById('connect-db-btn').addEventListener('click', () => {
+      const engine = dbEngineSelect.value;
+      if (engine === 'url') {
+        const remoteUrl = document.getElementById('db-remote-url').value.trim();
+        if (!remoteUrl) return;
+        vscode.postMessage({
+          type: 'connectRemoteDb',
+          config: {
+            engine: 'url',
+            host: remoteUrl,
+            port: 443,
+            user: '',
+            database: 'remote_url'
+          }
+        });
+      } else {
+        const host = document.getElementById('db-host').value.trim() || 'localhost';
+        const port = Number(document.getElementById('db-port').value) || 5432;
+        const user = document.getElementById('db-user').value.trim() || 'postgres';
+        const password = document.getElementById('db-pass').value;
+        const database = document.getElementById('db-name').value.trim() || 'postgres';
+        const dbSchema = document.getElementById('db-schema').value.trim() || 'public';
+        const tableFilter = document.getElementById('db-filter').value.trim();
+        const ssl = document.getElementById('db-ssl').checked;
+        vscode.postMessage({
+          type: 'connectRemoteDb',
+          config: {
+            engine: 'postgres',
+            host,
+            port,
+            user,
+            password,
+            database,
+            dbSchema,
+            tableFilter: tableFilter || undefined,
+            ssl
+          }
+        });
+      }
+    });
+
+    const stopSidebarBtn = document.getElementById('stop-room-sidebar-btn');
+    const peersContainer = document.getElementById('peers-container');
+
+    stopSidebarBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'stopAllRooms' });
+    });
+
+    function renderSidebarPeers(peers) {
+      if (!Array.isArray(peers) || peers.length === 0) {
+        peersContainer.innerHTML = '';
+        return;
+      }
+      stopSidebarBtn.style.display = 'block';
+      peersContainer.innerHTML =
+        '<div style="font-weight:700;margin-bottom:4px;">👥 Usuarios en la sala (' + peers.length + '):</div>' +
+        peers
+          .map(
+            p =>
+              '<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 6px;background:rgba(255,255,255,0.05);border-radius:4px;margin-bottom:3px;">' +
+              '<span style="display:flex;align-items:center;gap:6px;"><span style="width:9px;height:9px;border-radius:50%;background:' +
+              (p.color || '#38bdf8') +
+              ';display:inline-block;"></span><b>' +
+              p.name +
+              '</b></span>' +
+              '<span style="opacity:0.75;font-size:10.5px;">' +
+              (p.activeTable ? 'Editando: ' + p.activeTable : 'En línea') +
+              '</span></div>'
+          )
+          .join('');
+    }
+
     window.addEventListener('message', event => {
       const msg = event.data;
       if (msg.type === 'hostInfo') {
+        stopSidebarBtn.style.display = 'block';
         document.getElementById('host-status').innerHTML =
           '<b>¡Sala activa en puerto ' + msg.port + '!</b> Comparte la IP de tu red Wi-Fi/LAN (no la de WSL/Virtual):';
+        if (msg.peers) {
+          renderSidebarPeers(msg.peers);
+        }
         const ipsList = document.getElementById('ips-list');
         ipsList.innerHTML = '';
         (msg.allUrls || []).forEach(item => {
@@ -1907,6 +2710,14 @@ export class SqlErdSidebarProvider implements vscode.WebviewViewProvider {
           row.appendChild(btn);
           ipsList.appendChild(row);
         });
+      } else if (msg.type === 'peersList') {
+        renderSidebarPeers(msg.peers);
+      } else if (msg.type === 'roomStopped') {
+        stopSidebarBtn.style.display = 'none';
+        peersContainer.innerHTML = '';
+        document.getElementById('ips-list').innerHTML = '';
+        document.getElementById('host-status').innerHTML =
+          'Sala detenida. Abre un diagrama y pulsa <b>"🟢 Compartir Sala"</b> para iniciar una nueva.';
       } else if (msg.type === 'filesList') {
         const container = document.getElementById('files-container');
         if (!msg.files || msg.files.length === 0) {
